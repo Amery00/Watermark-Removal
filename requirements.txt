@@ -1,0 +1,28 @@
+# Core image processing
+Pillow>=10.0.0
+pillow-heif>=1.0.0
+
+# Computer vision & matrix operations
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Scientific filtering (gaussian blur, etc.)
+scipy>=1.10.0
+
+# Visualization (optional, for --visualize debug mode)
+matplotlib>=3.7.0
+# Web API framework
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+
+# Optional: OCR enhancement for watermark detection
+easyocr>=1.7.0
+pytesseract>=0.3.10
+
+# Visualization (optional, for --visualize debug mode)
+matplotlib>=3.7.0
+
+# GUI dependencies (built-in on Windows/macOS, need system package on Linux)
+# Linux users should install: sudo apt-get install python3-tk
+# tkinter is included with standard Python on Windows and macOS
