@@ -15,6 +15,7 @@ matplotlib>=3.7.0
 fastapi>=0.100.0
 uvicorn>=0.23.0
 python-multipart>=0.0.6
+requests>=2.31.0
 
 # Optional: OCR enhancement for watermark detection
 easyocr>=1.7.0

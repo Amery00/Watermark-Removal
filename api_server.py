@@ -46,6 +46,7 @@ from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Query
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 import numpy as np
@@ -152,6 +153,16 @@ def _cleanup(*paths: str):
                 pass
 
 
+def _normalize_response_options(output_format: str, return_type: str) -> tuple[str, str]:
+    fmt = (output_format or "png").lower().strip()
+    rtype = (return_type or "file").lower().strip()
+    if fmt not in ("png", "jpg", "jpeg"):
+        raise HTTPException(status_code=400, detail="output_format 仅支持 png/jpg/jpeg")
+    if rtype not in ("file", "base64", "info"):
+        raise HTTPException(status_code=400, detail="return_type 仅支持 file/base64/info")
+    return ("jpg" if fmt == "jpeg" else fmt), rtype
+
+
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
@@ -179,7 +190,7 @@ def health():
         status="ok",
         version="1.1.0",
         timestamp=datetime.now().isoformat(),
-        features=["watermark_detection", "watermark_removal", "auto_removal", "replica_blend"],
+        features=["watermark_detection", "watermark_removal", "auto_removal", "replica_blend", "ai_replica_generation"],
     )
 
 
@@ -223,6 +234,11 @@ def api_remove(
     corner_blur: float = Form(2.0, description="左下角模糊度"),
     output_format: str = Form("png", description="输出格式: png 或 jpg"),
     return_type: str = Form("file", description="返回类型: file=直接下载, base64=JSON含base64, info=仅返回信息"),
+    ai_replicate: bool = Form(False, description="未提供replica时是否调用AI生成复刻图"),
+    ai_api_base_url: str = Form("", description="AI接口基础地址，如 https://api.openai.com/v1"),
+    ai_api_key: str = Form("", description="AI接口密钥"),
+    ai_model: str = Form("auto", description="AI图像模型名，默认auto自动识别"),
+    ai_prompt: str = Form("保留主体构图和风格，完整去除所有底部水印、角标与文字标识，输出自然无痕迹图像。", description="AI复刻图提示词"),
 ):
     """
     上传原图（和可选复刻图），根据指定参数去除水印。
@@ -233,6 +249,7 @@ def api_remove(
     out_tmp = None
 
     try:
+        output_format, return_type = _normalize_response_options(output_format, return_type)
         # 保存上传
         orig_tmp = _save_upload(original)
         rep_tmp = _save_upload(replica) if replica else None
@@ -249,6 +266,11 @@ def api_remove(
             strip_height=strip_height,
             blend_zone=blend_zone,
             corner_tex_blur=corner_blur,
+            ai_replicate=ai_replicate,
+            ai_api_base_url=ai_api_base_url,
+            ai_api_key=ai_api_key,
+            ai_model=ai_model,
+            ai_prompt=ai_prompt,
         )
 
         if return_type == "info":
@@ -283,6 +305,7 @@ def api_remove(
             result_path,
             media_type=media_type,
             filename=f"cleaned.{output_format}",
+            background=BackgroundTask(_cleanup, result_path),
         )
 
     except Exception as e:
@@ -304,6 +327,11 @@ def api_remove_auto(
     replica: Optional[UploadFile] = File(None, description="AI复刻清洁图像（可选，强烈建议提供）"),
     output_format: str = Form("png", description="输出格式: png 或 jpg"),
     return_type: str = Form("file", description="返回类型: file=直接下载, base64=JSON含base64, info=仅返回信息"),
+    ai_replicate: bool = Form(False, description="未提供replica时是否调用AI生成复刻图"),
+    ai_api_base_url: str = Form("", description="AI接口基础地址，如 https://api.openai.com/v1"),
+    ai_api_key: str = Form("", description="AI接口密钥"),
+    ai_model: str = Form("auto", description="AI图像模型名，默认auto自动识别"),
+    ai_prompt: str = Form("保留主体构图和风格，完整去除所有底部水印、角标与文字标识，输出自然无痕迹图像。", description="AI复刻图提示词"),
 ):
     """
     **全自动水印去除** — 无需任何手动参数！
@@ -324,6 +352,7 @@ def api_remove_auto(
     out_tmp = None
 
     try:
+        output_format, return_type = _normalize_response_options(output_format, return_type)
         # 保存上传
         orig_tmp = _save_upload(image)
         rep_tmp = _save_upload(replica) if replica else None
@@ -344,6 +373,11 @@ def api_remove_auto(
             strip_height=meta.suggested_strip_height,
             blend_zone=meta.suggested_blend_zone,
             corner_tex_blur=2.0,
+            ai_replicate=ai_replicate,
+            ai_api_base_url=ai_api_base_url,
+            ai_api_key=ai_api_key,
+            ai_model=ai_model,
+            ai_prompt=ai_prompt,
         )
 
         elapsed = int((time.time() - start) * 1000)
@@ -389,6 +423,7 @@ def api_remove_auto(
             result_path,
             media_type=media_type,
             filename=f"cleaned_auto.{output_format}",
+            background=BackgroundTask(_cleanup, result_path),
             headers={
                 "X-Watermark-Detected": str(meta_detected).lower(),
                 "X-Detection-Confidence": f"{meta_confidence:.2f}",

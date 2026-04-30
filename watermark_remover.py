@@ -19,12 +19,15 @@ Usage:
 """
 
 import argparse
+import base64
+import json
 import subprocess
 import sys
 import shutil
 import os
+import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import numpy as np
 from PIL import Image
@@ -311,7 +314,122 @@ class WatermarkRemover:
 
 
 # ---------------------------------------------------------------------------
-# 3. 完整处理流水线
+# 3. AI 复刻图生成（可选）
+# ---------------------------------------------------------------------------
+
+class AIReplicaGenerator:
+    """调用 OpenAI 兼容图像编辑接口生成无水印复刻图。"""
+
+    def __init__(self, api_base_url: str, api_key: str, model: str = "auto", timeout_sec: int = 90):
+        self.api_base_url = api_base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.timeout_sec = timeout_sec
+
+    def generate(self, original_np: np.ndarray, output_path: str, prompt: str) -> str:
+        try:
+            import requests
+        except ImportError as e:
+            raise ImportError("启用AI复刻图需要安装 requests，请先执行: pip install requests") from e
+
+        if not self.api_base_url or not self.api_key:
+            raise ValueError("AI API配置不完整，请提供 ai_api_base_url 与 ai_api_key。")
+        resolved_model = self._resolve_model(requests)
+
+        fd, tmp_png = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            Image.fromarray(original_np).save(tmp_png, format="PNG")
+            endpoint = f"{self.api_base_url}/images/edits"
+            headers = {"Authorization": f"Bearer {self.api_key}"}
+            data = {
+                "model": resolved_model,
+                "prompt": prompt,
+                "response_format": "b64_json",
+            }
+            with open(tmp_png, "rb") as f:
+                files = {"image": ("input.png", f, "image/png")}
+                resp = requests.post(
+                    endpoint,
+                    headers=headers,
+                    data=data,
+                    files=files,
+                    timeout=self.timeout_sec,
+                )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"AI接口请求失败: HTTP {resp.status_code} - {resp.text[:300]}")
+            payload = resp.json()
+            b64 = self._extract_b64(payload)
+            if not b64:
+                raise RuntimeError(f"AI接口返回中未找到图像数据: {json.dumps(payload)[:300]}")
+            with open(output_path, "wb") as out:
+                out.write(base64.b64decode(b64))
+            return output_path
+        finally:
+            if os.path.exists(tmp_png):
+                os.remove(tmp_png)
+
+    def _resolve_model(self, requests_module) -> str:
+        """自动识别可用图像模型；失败时回退到 gpt-image-1。"""
+        configured = (self.model or "").strip()
+        if configured and configured.lower() not in ("auto", "automatic", "default"):
+            return configured
+
+        candidates = self._fetch_models(requests_module)
+        # 优先常见图像编辑/生成模型
+        preferred_patterns = ("gpt-image", "image", "vision")
+        for name in candidates:
+            lower = name.lower()
+            if any(p in lower for p in preferred_patterns):
+                print(f"[信息] 自动识别AI模型: {name}")
+                return name
+
+        if candidates:
+            print(f"[信息] 未找到明显图像模型，使用首个可用模型: {candidates[0]}")
+            return candidates[0]
+
+        print("[警告] 自动识别AI模型失败，回退到 gpt-image-1")
+        return "gpt-image-1"
+
+    def _fetch_models(self, requests_module) -> List[str]:
+        endpoint = f"{self.api_base_url}/models"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            resp = requests_module.get(endpoint, headers=headers, timeout=min(self.timeout_sec, 30))
+            if resp.status_code >= 400:
+                return []
+            payload = resp.json()
+            data = payload.get("data", []) if isinstance(payload, dict) else []
+            names: List[str] = []
+            for item in data:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    names.append(item["id"])
+            return names
+        except Exception:
+            return []
+
+    @staticmethod
+    def _extract_b64(payload: dict) -> Optional[str]:
+        if isinstance(payload, dict):
+            if "image_base64" in payload and isinstance(payload["image_base64"], str):
+                return payload["image_base64"]
+            if "data" in payload and isinstance(payload["data"], list) and payload["data"]:
+                first = payload["data"][0]
+                if isinstance(first, dict):
+                    if isinstance(first.get("b64_json"), str):
+                        return first["b64_json"]
+                    if isinstance(first.get("image_base64"), str):
+                        return first["image_base64"]
+        return None
+
+
+def _scale_by_ref(value: int, current: int, ref: int, min_v: int, max_v: int) -> int:
+    scaled = int(round(value * (current / max(ref, 1))))
+    return max(min_v, min(max_v, scaled))
+
+
+# ---------------------------------------------------------------------------
+# 4. 完整处理流水线
 # ---------------------------------------------------------------------------
 
 def process_image(
@@ -321,6 +439,11 @@ def process_image(
         visualize: bool = False,
         # 自动检测
         auto_detect: bool = False,
+        ai_replicate: bool = False,
+        ai_api_base_url: str = "",
+        ai_api_key: str = "",
+        ai_model: str = "auto",
+        ai_prompt: str = "保留主体构图和风格，完整去除所有底部水印、角标与文字标识，输出自然无痕迹图像。",
         # 底部水印参数（auto_detect=False 时生效）
         strip_height: int = 90,
         blend_zone: int = 20,
@@ -331,6 +454,7 @@ def process_image(
         corner_inpaint_y2_offset: int = 10,
         corner_tex_offset_y: int = -60,
         corner_tex_blur: float = 2.0,
+        scale_params: bool = True,
 ) -> str:
     """
     完整处理入口。
@@ -354,11 +478,24 @@ def process_image(
     print(f"      尺寸: {w}×{h}")
 
     replica_np = None
+    ai_replica_tmp = None
     if replica_path:
         print(f"[2/5] 读取复刻图: {replica_path}")
         rep_img = ImageDecoder.load(replica_path)
         replica_np = np.array(rep_img.convert("RGB"))
         print(f"      尺寸: {replica_np.shape[1]}×{replica_np.shape[0]}")
+    elif ai_replicate:
+        print("[2/5] 未提供复刻图，正在调用AI生成复刻图...")
+        ai_replica_tmp = _temp_path(output_path, "_ai_replica.png")
+        generator = AIReplicaGenerator(
+            api_base_url=ai_api_base_url,
+            api_key=ai_api_key,
+            model=ai_model,
+        )
+        generator.generate(orig_np, ai_replica_tmp, ai_prompt)
+        rep_img = ImageDecoder.load(ai_replica_tmp)
+        replica_np = np.array(rep_img.convert("RGB"))
+        print(f"      AI复刻图已生成: {ai_replica_tmp}")
     else:
         print("[2/5] 未提供复刻图，将仅使用Inpainting模式。")
 
@@ -386,6 +523,15 @@ def process_image(
                 print(f"      未检测到水印 (置信度 {meta.confidence:.2f})")
         except Exception as e:
             print(f"      [警告] 自动检测失败: {e}，使用默认参数")
+
+    if scale_params and not auto_detect:
+        strip_height = _scale_by_ref(strip_height, h, 768, 36, max(60, h // 2))
+        blend_zone = _scale_by_ref(blend_zone, h, 768, 8, 80)
+        corner_inpaint_x1 = _scale_by_ref(corner_inpaint_x1, w, 1376, 2, max(20, w // 4))
+        corner_inpaint_x2 = _scale_by_ref(corner_inpaint_x2, w, 1376, 30, max(120, w // 2))
+        corner_inpaint_y1_offset = _scale_by_ref(corner_inpaint_y1_offset, h, 768, 24, max(80, h // 2))
+        corner_inpaint_y2_offset = _scale_by_ref(corner_inpaint_y2_offset, h, 768, 6, 40)
+        corner_tex_offset_y = -_scale_by_ref(abs(corner_tex_offset_y), h, 768, 16, 120)
 
     # 2. 初始化引擎
     engine = WatermarkRemover(orig_np, replica_np)
@@ -432,11 +578,14 @@ def process_image(
     if visualize:
         _show_comparison(orig_np, working)
 
-    return str(Path(output_path).resolve())
+    abs_output = str(Path(output_path).resolve())
+    if ai_replica_tmp and os.path.exists(ai_replica_tmp):
+        os.remove(ai_replica_tmp)
+    return abs_output
 
 
 # ---------------------------------------------------------------------------
-# 4. 工具函数
+# 5. 工具函数
 # ---------------------------------------------------------------------------
 
 def _temp_path(src: str, suffix: str) -> str:
@@ -482,7 +631,7 @@ def _show_comparison(original: np.ndarray, cleaned: np.ndarray):
 
 
 # ---------------------------------------------------------------------------
-# 5. 命令行入口
+# 6. 命令行入口
 # ---------------------------------------------------------------------------
 
 def main():
@@ -506,6 +655,11 @@ def main():
     parser.add_argument("-o", "--output", default="output.png", help="输出图像路径（默认: output.png）")
     parser.add_argument("--visualize", action="store_true", help="显示处理前后对比图")
     parser.add_argument("--auto-detect", action="store_true", help="自动检测水印位置（覆盖手动参数）")
+    parser.add_argument("--ai-replicate", action="store_true", help="未提供复刻图时，自动调用AI生成复刻图")
+    parser.add_argument("--ai-api-base-url", default=os.getenv("AI_API_BASE_URL", ""), help="AI接口基础地址，如 https://api.openai.com/v1")
+    parser.add_argument("--ai-api-key", default=os.getenv("AI_API_KEY", ""), help="AI接口密钥，可用环境变量 AI_API_KEY")
+    parser.add_argument("--ai-model", default=os.getenv("AI_MODEL", "auto"), help="AI图像模型名，默认auto自动识别")
+    parser.add_argument("--ai-prompt", default="保留主体构图和风格，完整去除所有底部水印、角标与文字标识，输出自然无痕迹图像。", help="AI复刻图生成提示词")
 
     # 高级参数（通常保持默认，--auto-detect 时自动覆盖）
     parser.add_argument("--strip-height", type=int, default=90, help="底部替换带高度（默认90）")
@@ -520,6 +674,11 @@ def main():
         output_path=args.output,
         visualize=args.visualize,
         auto_detect=args.auto_detect,
+        ai_replicate=args.ai_replicate,
+        ai_api_base_url=args.ai_api_base_url,
+        ai_api_key=args.ai_api_key,
+        ai_model=args.ai_model,
+        ai_prompt=args.ai_prompt,
         strip_height=args.strip_height,
         blend_zone=args.blend_zone,
         corner_tex_blur=args.corner_blur,

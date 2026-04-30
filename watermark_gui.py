@@ -16,6 +16,9 @@ Usage:
 import os
 import sys
 import threading
+import io
+from contextlib import redirect_stdout, redirect_stderr
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -85,6 +88,7 @@ class WatermarkGUI(tk.Tk):
         self.preview_mode = tk.StringVar(value="original")
         self.auto_mode = tk.BooleanVar(value=False)
         self.use_ocr = tk.BooleanVar(value=False)
+        self.ai_replicate = tk.BooleanVar(value=False)
 
         self._build_styles()
         self._build_header()
@@ -149,6 +153,20 @@ class WatermarkGUI(tk.Tk):
             activebackground=THEME["panel_bg"], state="disabled",
         )
         self.ocr_check.pack(anchor=tk.W, padx=(20, 0))
+
+        tk.Checkbutton(
+            mode_frame, text="未提供复刻图时，自动调用AI生成复刻图",
+            variable=self.ai_replicate,
+            bg=THEME["panel_bg"], fg=THEME["text_light"], font=("Microsoft YaHei", 9),
+            activebackground=THEME["panel_bg"],
+        ).pack(anchor=tk.W, padx=(20, 0))
+
+        self.var_ai_api_base = tk.StringVar(value=os.getenv("AI_API_BASE_URL", ""))
+        self.var_ai_api_key = tk.StringVar(value=os.getenv("AI_API_KEY", ""))
+        self.var_ai_model = tk.StringVar(value=os.getenv("AI_MODEL", "auto"))
+        self._build_entry(panel, "AI API Base URL", self.var_ai_api_base)
+        self._build_entry(panel, "AI API Key", self.var_ai_api_key, show="*")
+        self._build_entry(panel, "AI Model (auto=自动识别)", self.var_ai_model)
 
         # 自动检测结果展示区
         self.auto_result_frame = tk.Frame(panel, bg="#fff9e6", bd=1, relief="solid", highlightbackground=THEME["warning"])
@@ -249,6 +267,22 @@ class WatermarkGUI(tk.Tk):
             tk.Label(frame, text=tooltip, font=("Microsoft YaHei", 8), fg=THEME["text_light"],
                     bg=THEME["panel_bg"], wraplength=320, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 0))
 
+    def _build_entry(self, parent, label: str, var: tk.StringVar, show: Optional[str] = None):
+        frame = tk.Frame(parent, bg=THEME["panel_bg"])
+        frame.pack(fill=tk.X, padx=16, pady=4)
+        ttk.Label(frame, text=label, style="Body.TLabel").pack(anchor=tk.W)
+        entry = tk.Entry(
+            frame,
+            textvariable=var,
+            show=show,
+            font=("Consolas", 9),
+            bg="#fbfcfe",
+            fg=THEME["text"],
+            relief="solid",
+            bd=1,
+        )
+        entry.pack(fill=tk.X, pady=(4, 0))
+
     def _on_slider_change(self, var_name: str):
         var = getattr(self, f"var_{var_name}")
         lbl = getattr(self, f"lbl_{var_name}_value")
@@ -298,6 +332,59 @@ class WatermarkGUI(tk.Tk):
         self.placeholder_id = self.canvas.create_text(0, 0, text="请选择原图以开始预览",
             font=("Microsoft YaHei", 13), fill=THEME["text_light"], anchor="center")
         self._center_placeholder()
+        self._build_console(container)
+
+    def _build_console(self, parent):
+        console = tk.Frame(parent, bg="#0f172a", height=180)
+        console.pack(fill=tk.X, side=tk.BOTTOM)
+        console.pack_propagate(False)
+
+        top = tk.Frame(console, bg="#111827", height=28)
+        top.pack(fill=tk.X, side=tk.TOP)
+        top.pack_propagate(False)
+        tk.Label(
+            top,
+            text="  控制台日志",
+            bg="#111827",
+            fg="#cbd5e1",
+            font=("Microsoft YaHei", 9, "bold"),
+            anchor="w",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(
+            top,
+            text="清空",
+            font=("Microsoft YaHei", 8),
+            bg="#1f2937",
+            fg="#e5e7eb",
+            relief="flat",
+            command=lambda: self.console_text.delete("1.0", tk.END),
+        ).pack(side=tk.RIGHT, padx=8, pady=3)
+
+        self.console_text = tk.Text(
+            console,
+            bg="#0b1020",
+            fg="#a7f3d0",
+            insertbackground="#a7f3d0",
+            font=("Consolas", 9),
+            relief="flat",
+            bd=0,
+            wrap="word",
+        )
+        self.console_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=(4, 6))
+        self._append_log("GUI 已启动，等待操作。")
+
+    def _append_log(self, msg: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        line = f"[{timestamp}] {msg}\n"
+
+        def _write():
+            self.console_text.insert(tk.END, line)
+            self.console_text.see(tk.END)
+
+        if threading.current_thread() is threading.main_thread():
+            _write()
+        else:
+            self.after(0, _write)
 
     def _center_placeholder(self):
         w = self.canvas.winfo_width()
@@ -349,6 +436,7 @@ class WatermarkGUI(tk.Tk):
         if not path: return
         self.original_path = path
         self.original_label.configure(text=Path(path).name)
+        self._append_log(f"已选择原图: {path}")
         self._load_original_preview()
         self._set_status(f"已加载原图: {Path(path).name}")
         # 如果开启了自动模式，自动检测
@@ -363,12 +451,14 @@ class WatermarkGUI(tk.Tk):
         if not path: return
         self.replica_path = path
         self.replica_label.configure(text=Path(path).name)
+        self._append_log(f"已选择复刻图: {path}")
         self._set_status(f"已加载复刻图: {Path(path).name}")
 
     def _clear_replica(self):
         self.replica_path = None
         self.replica_label.configure(text="未选择")
         self.replica_array = None
+        self._append_log("已清除复刻图")
         self._set_status("已清除复刻图")
 
     def _load_original_preview(self):
@@ -391,6 +481,7 @@ class WatermarkGUI(tk.Tk):
             messagebox.showwarning("缺少文件", "请先选择原图！")
             return
         self._set_status("正在检测水印…", progress=30)
+        self._append_log(f"开始检测水印 (OCR={'开' if self.use_ocr.get() else '关'})")
         thread = threading.Thread(target=self._do_detect_only, daemon=True)
         thread.start()
 
@@ -407,6 +498,7 @@ class WatermarkGUI(tk.Tk):
             }
             self.after(0, self._on_detect_done, meta)
         except Exception as e:
+            self._append_log(f"检测失败: {e}")
             self.after(0, lambda: messagebox.showerror("检测失败", str(e)))
             self.after(0, lambda: self._set_status("检测失败", 0))
 
@@ -435,6 +527,7 @@ class WatermarkGUI(tk.Tk):
                 f"提示: 可手动调整参数或使用复刻图"
             )
         self.auto_detected_label.configure(text=text, fg=color)
+        self._append_log(f"检测完成: detected={meta.detected}, confidence={meta.confidence:.2f}, method={meta.method}")
         self._set_status(f"检测完成: {'发现水印' if meta.detected else '未检测到'}", progress=100)
 
     # ------------------------------------------------------------------
@@ -456,6 +549,10 @@ class WatermarkGUI(tk.Tk):
 
         self.process_btn.configure(state="disabled")
         self.save_btn.configure(state="disabled")
+        self._append_log(
+            f"开始处理: auto_detect={auto_detect}, strip_height={strip_h}, blend_zone={blend_z}, "
+            f"corner_blur={corner_b}, ai_replicate={self.ai_replicate.get()}"
+        )
         self._set_status("正在处理…", progress=10)
 
         thread = threading.Thread(target=self._do_process,
@@ -470,16 +567,25 @@ class WatermarkGUI(tk.Tk):
             out_path = str(orig_dir / f"{orig_name}_cleaned.png")
 
             self.after(0, lambda: self._set_status("正在去除水印…", progress=50))
-            result = process_image(
-                original_path=self.original_path,
-                replica_path=self.replica_path,
-                output_path=out_path,
-                visualize=False,
-                auto_detect=auto_detect,
-                strip_height=strip_h,
-                blend_zone=blend_z,
-                corner_tex_blur=corner_b,
-            )
+            logs = io.StringIO()
+            with redirect_stdout(logs), redirect_stderr(logs):
+                result = process_image(
+                    original_path=self.original_path,
+                    replica_path=self.replica_path,
+                    output_path=out_path,
+                    visualize=False,
+                    auto_detect=auto_detect,
+                    strip_height=strip_h,
+                    blend_zone=blend_z,
+                    corner_tex_blur=corner_b,
+                    ai_replicate=self.ai_replicate.get(),
+                    ai_api_base_url=self.var_ai_api_base.get().strip(),
+                    ai_api_key=self.var_ai_api_key.get().strip(),
+                    ai_model=self.var_ai_model.get().strip() or "auto",
+                )
+            log_text = logs.getvalue().strip()
+            if log_text:
+                self._append_log(log_text)
             self.result_path = result
             self.result_array = np.array(ImageDecoder.load(result))
             self.after(0, self._on_process_done)
@@ -487,6 +593,7 @@ class WatermarkGUI(tk.Tk):
             self.after(0, lambda err=str(e): self._on_process_error(err))
 
     def _on_process_done(self):
+        self._append_log(f"处理完成，输出: {self.result_path}")
         self._set_status(f"处理完成: {Path(self.result_path).name}", progress=100)
         self.process_btn.configure(state="normal")
         self.save_btn.configure(state="normal")
@@ -496,6 +603,7 @@ class WatermarkGUI(tk.Tk):
         messagebox.showinfo("完成", "水印去除完成！\n点击「对比」按钮可查看处理前后差异。")
 
     def _on_process_error(self, err: str):
+        self._append_log(f"处理失败: {err}")
         self._set_status("处理失败", progress=0)
         self.process_btn.configure(state="normal")
         messagebox.showerror("处理错误", f"水印去除过程中发生错误:\n{err}")
@@ -519,6 +627,7 @@ class WatermarkGUI(tk.Tk):
                 img.save(path, quality=95)
             else:
                 img.save(path)
+            self._append_log(f"结果已保存: {path}")
             self._set_status(f"已保存: {Path(path).name}")
             messagebox.showinfo("保存成功", f"结果已保存到:\n{path}")
         except Exception as e:
@@ -544,6 +653,7 @@ class WatermarkGUI(tk.Tk):
             )
             self.api_btn.configure(text="停止 API 服务")
             self.api_status_label.configure(text="API 运行中: http://0.0.0.0:8000", foreground=THEME["success"])
+            self._append_log("API 服务已启动: http://0.0.0.0:8000")
             self._set_status("API 服务已启动: http://0.0.0.0:8000")
 
             # 在新线程中监控进程输出
@@ -553,6 +663,7 @@ class WatermarkGUI(tk.Tk):
                         line = self.api_process.stdout.readline()
                         if line:
                             print(f"[API] {line.strip()}")
+                            self._append_log(f"[API] {line.strip()}")
                 except Exception:
                     pass
             threading.Thread(target=_monitor, daemon=True).start()
@@ -570,6 +681,7 @@ class WatermarkGUI(tk.Tk):
             self.api_process = None
         self.api_btn.configure(text="启动 API 服务")
         self.api_status_label.configure(text="API 未启动", foreground=THEME["text_light"])
+        self._append_log("API 服务已停止")
         self._set_status("API 服务已停止")
 
     # ------------------------------------------------------------------
